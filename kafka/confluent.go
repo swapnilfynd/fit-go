@@ -22,6 +22,8 @@ package kafka
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"sync"
@@ -148,13 +150,24 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 		_ = pCfg.SetKey("retry.backoff.ms", int(config.RetryBackoff.Milliseconds()))
 	}
 
+	partitioner, err := confluentPartitioner(config.Partitioner)
+	if err != nil {
+		return nil, err
+	}
+	if partitioner != "" {
+		_ = pCfg.SetKey("partitioner", partitioner)
+	}
+
 	return &ConfluentProducer{
-		configMap:      pCfg,
-		logger:         cc.logger,
-		brokers:        cc.brokers,
-		configuredAcks: configuredAcks,
-		idempotent:     config.IdempotentProducer,
-		producers:      make(map[int]confluentProducerDriver),
+		configMap:         pCfg,
+		logger:            cc.logger,
+		brokers:           cc.brokers,
+		configuredAcks:    configuredAcks,
+		idempotent:        config.IdempotentProducer,
+		partitioner:       config.Partitioner,
+		producers:         make(map[int]confluentProducerDriver),
+		partitionCounters: make(map[string]uint32),
+		metadataTimeout:   config.Timeout,
 	}, nil
 }
 
@@ -280,6 +293,7 @@ type ConfluentProducer struct {
 	brokers        []string
 	configuredAcks int
 	idempotent     bool
+	partitioner    ProducerPartitioner
 	newProducer    func(*ckafka.ConfigMap) (confluentProducerDriver, error)
 
 	mu        sync.Mutex
@@ -292,6 +306,11 @@ type ConfluentProducer struct {
 
 	closeTimeout   time.Duration
 	pendingReports atomic.Int64
+
+	partitionMu       sync.Mutex
+	partitionCounters map[string]uint32
+	partitionSeed     func() (uint32, error)
+	metadataTimeout   time.Duration
 }
 
 // confluentProducerDriver is the narrow librdkafka surface used by the fit
@@ -301,6 +320,10 @@ type confluentProducerDriver interface {
 	Produce(*ckafka.Message, chan ckafka.Event) error
 	Flush(timeoutMs int) int
 	Close()
+}
+
+type confluentProducerMetadataDriver interface {
+	GetMetadata(topic *string, allTopics bool, timeoutMs int) (*ckafka.Metadata, error)
 }
 
 // Connect establishes the confluent Producer connection to the brokers.
@@ -368,9 +391,10 @@ func (cp *ConfluentProducer) produceWithMetadata(ctx context.Context, topic stri
 		return nil, err
 	}
 
-	brokerMessages := make([]*ckafka.Message, 0, len(messages))
-	for _, msg := range messages {
-		brokerMessages = append(brokerMessages, buildConfluentMessage(topic, msg))
+	brokerMessages, err := cp.buildBrokerMessages(producer, topic, messages)
+	if err != nil {
+		done()
+		return nil, err
 	}
 	deliveries, err := cp.produceAndDrain(ctx, producer, brokerMessages, done)
 	if err != nil {
@@ -422,9 +446,12 @@ func (cp *ConfluentProducer) produceBatch(ctx context.Context, topicMessages []T
 
 	brokerMessages := make([]*ckafka.Message, 0, totalMessages)
 	for _, tm := range topicMessages {
-		for _, msg := range tm.Messages {
-			brokerMessages = append(brokerMessages, buildConfluentMessage(tm.Topic, msg))
+		messages, buildErr := cp.buildBrokerMessages(producer, tm.Topic, tm.Messages)
+		if buildErr != nil {
+			done()
+			return buildErr
 		}
+		brokerMessages = append(brokerMessages, messages...)
 	}
 	if _, err := cp.produceAndDrain(ctx, producer, brokerMessages, done); err != nil {
 		return fmt.Errorf("kafka/confluent: batch produce failed: %w", err)
@@ -1491,6 +1518,127 @@ func mapCompressionToString(ct CompressionType) string {
 	}
 }
 
+func confluentPartitioner(partitioner ProducerPartitioner) (string, error) {
+	switch partitioner {
+	case ProducerPartitionerDefault:
+		return "", nil
+	case ProducerPartitionerKafkaJSLegacy:
+		return "murmur2_random", nil
+	default:
+		return "", fmt.Errorf("kafka/confluent: unsupported producer partitioner %q", partitioner)
+	}
+}
+
+const defaultProducerMetadataTimeout = 30 * time.Second
+
+func (cp *ConfluentProducer) buildBrokerMessages(
+	producer confluentProducerDriver,
+	topic string,
+	messages []Message,
+) ([]*ckafka.Message, error) {
+	needsKafkaJSKeylessPartition := false
+	for _, msg := range messages {
+		if cp.partitioner == ProducerPartitionerKafkaJSLegacy && msg.Partition < 0 && msg.Key == nil {
+			needsKafkaJSKeylessPartition = true
+			break
+		}
+	}
+
+	var partitionMetadata []ckafka.PartitionMetadata
+	if needsKafkaJSKeylessPartition {
+		metadataDriver, ok := producer.(confluentProducerMetadataDriver)
+		if !ok {
+			return nil, fmt.Errorf("kafka/confluent: KafkaJS legacy keyless partitioning requires producer metadata")
+		}
+		timeout := cp.metadataTimeout
+		if timeout <= 0 {
+			timeout = defaultProducerMetadataTimeout
+		}
+		metadata, err := metadataDriver.GetMetadata(&topic, false, int(timeout.Milliseconds()))
+		if err != nil {
+			return nil, fmt.Errorf("kafka/confluent: metadata for topic %s: %w", topic, err)
+		}
+		if metadata == nil {
+			return nil, fmt.Errorf("kafka/confluent: metadata for topic %s was nil", topic)
+		}
+		topicMetadata, ok := metadata.Topics[topic]
+		if !ok {
+			return nil, fmt.Errorf("kafka/confluent: metadata for topic %s was not returned", topic)
+		}
+		if topicMetadata.Error.Code() != ckafka.ErrNoError {
+			return nil, fmt.Errorf("kafka/confluent: metadata for topic %s: %w", topic, topicMetadata.Error)
+		}
+		if len(topicMetadata.Partitions) == 0 {
+			return nil, fmt.Errorf("kafka/confluent: topic %s has no partitions", topic)
+		}
+		partitionMetadata = topicMetadata.Partitions
+	}
+
+	brokerMessages := make([]*ckafka.Message, 0, len(messages))
+	for _, msg := range messages {
+		brokerMessage := buildConfluentMessage(topic, msg)
+		if cp.partitioner == ProducerPartitionerKafkaJSLegacy && msg.Partition < 0 && msg.Key == nil {
+			partition, err := cp.nextKafkaJSKeylessPartition(topic, partitionMetadata)
+			if err != nil {
+				return nil, err
+			}
+			brokerMessage.TopicPartition.Partition = partition
+		}
+		brokerMessages = append(brokerMessages, brokerMessage)
+	}
+	return brokerMessages, nil
+}
+
+func (cp *ConfluentProducer) nextKafkaJSKeylessPartition(
+	topic string,
+	partitionMetadata []ckafka.PartitionMetadata,
+) (int32, error) {
+	available := make([]int32, 0, len(partitionMetadata))
+	for _, partition := range partitionMetadata {
+		if partition.Leader >= 0 {
+			available = append(available, partition.ID)
+		}
+	}
+
+	cp.partitionMu.Lock()
+	defer cp.partitionMu.Unlock()
+	if cp.partitionCounters == nil {
+		cp.partitionCounters = make(map[string]uint32)
+	}
+	counter, ok := cp.partitionCounters[topic]
+	if !ok {
+		seed := cp.partitionSeed
+		if seed == nil {
+			seed = kafkaJSPartitionCounterSeed
+		}
+		var err error
+		counter, err = seed()
+		if err != nil {
+			return 0, fmt.Errorf("kafka/confluent: seed KafkaJS partition counter: %w", err)
+		}
+	}
+	counter++
+	cp.partitionCounters[topic] = counter
+	positive := counter & 0x7fffffff
+	if len(available) > 0 {
+		return available[int(positive%uint32(len(available)))], nil
+	}
+	if len(partitionMetadata) == 0 {
+		return 0, fmt.Errorf("kafka/confluent: topic %s has no partitions", topic)
+	}
+	// KafkaJS returns the array index in this no-leader fallback rather than
+	// the partitionId field.
+	return int32(positive % uint32(len(partitionMetadata))), nil
+}
+
+func kafkaJSPartitionCounterSeed() (uint32, error) {
+	var randomBytes [32]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(randomBytes[:4]), nil
+}
+
 // mapSASLMechanismToString converts a string SASL mechanism name to the
 // librdkafka sasl.mechanism value.
 func mapSASLMechanismToString(mechanism string) string {
@@ -1514,7 +1662,7 @@ func buildConfluentMessage(topic string, msg Message) *ckafka.Message {
 		Value: msg.Value,
 	}
 
-	if len(msg.Key) > 0 {
+	if msg.Key != nil {
 		km.Key = msg.Key
 	}
 

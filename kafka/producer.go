@@ -17,6 +17,21 @@ package kafka
 
 import "time"
 
+// ProducerPartitioner selects the driver partitioning strategy for records
+// without an explicit partition. The zero value preserves the driver's
+// existing default and therefore keeps existing fit-go callers unchanged.
+type ProducerPartitioner string
+
+const (
+	// ProducerPartitionerDefault preserves librdkafka's configured/default
+	// partitioner.
+	ProducerPartitionerDefault ProducerPartitioner = ""
+	// ProducerPartitionerKafkaJSLegacy matches KafkaJS 2.2.4's legacy/default
+	// producer behavior: Java-compatible murmur2 for keyed records and a
+	// per-topic, randomly seeded round robin for keyless records.
+	ProducerPartitionerKafkaJSLegacy ProducerPartitioner = "kafkajs-legacy"
+)
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -47,6 +62,27 @@ type Message struct {
 	// Timestamp is the message timestamp. Zero value means the broker
 	// assigns a timestamp.
 	Timestamp time.Time
+}
+
+// NewMessage creates a keyless message whose partition is selected by the
+// configured producer partitioner. Message's zero value still means explicit
+// partition 0 for backward compatibility; callers that want automatic
+// partitioning should use this constructor.
+func NewMessage(value []byte) Message {
+	return Message{Value: value, Partition: -1}
+}
+
+// NewKeyedMessage creates a keyed message whose partition is selected by the
+// configured producer partitioner. A present empty key remains distinct from a
+// missing key, matching KafkaJS.
+func NewKeyedMessage(key, value []byte) Message {
+	return Message{Key: key, Value: value, Partition: -1}
+}
+
+// NewPartitionedMessage creates a message with an explicit partition override,
+// including partition 0.
+func NewPartitionedMessage(partition int, value []byte) Message {
+	return Message{Value: value, Partition: partition}
 }
 
 // TopicMessages groups messages destined for a single topic.
@@ -104,4 +140,8 @@ type ProducerConfig struct {
 
 	// RetryBackoff is the delay between retries.
 	RetryBackoff time.Duration
+
+	// Partitioner optionally selects a compatibility partitioner. The zero value
+	// preserves the existing librdkafka behavior.
+	Partitioner ProducerPartitioner
 }
