@@ -421,6 +421,87 @@ func TestKafkaJSCompatibleManualConsumerDisablesBackgroundAutoCommit(t *testing.
 	}
 }
 
+func TestKafkaJSCompatibleConsumerAppliesOptInTransportCompatibility(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &kafkaJSCompatibleConsumer{
+		brokers: []string{"127.0.0.1:1"},
+		fitCfg:  &Config{ClientID: "mixmaster-server"},
+		config: ConsumerConfig{
+			GroupID:                "mixmaster-consumer-common-group-1",
+			AutoCommit:             false,
+			ReadCommitted:          true,
+			AutoCreateTopics:       true,
+			DialTimeout:            time.Second,
+			RequestRetries:         5,
+			RetryBackoff:           300 * time.Millisecond,
+			RetryBackoffMax:        30 * time.Second,
+			RetryBackoffMultiplier: 2,
+			RetryBackoffFactor:     0.2,
+		},
+		logger: logger,
+	}
+	opts, err := consumer.clientOptions([]TopicConfig{{Topic: "background-task"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if got := client.OptValue(kgo.FetchIsolationLevel); got != int8(1) {
+		t.Fatalf("FetchIsolationLevel = %#v, want ReadCommitted", got)
+	}
+	if got := client.OptValue(kgo.AllowAutoTopicCreation); got != true {
+		t.Fatalf("AllowAutoTopicCreation = %#v, want true", got)
+	}
+	if got := client.OptValue(kgo.DialTimeout); got != time.Second {
+		t.Fatalf("DialTimeout = %#v, want 1s", got)
+	}
+	if got := client.OptValue(kgo.RequestRetries); got != int64(5) {
+		t.Fatalf("RequestRetries = %#v, want 5", got)
+	}
+	backoff, ok := client.OptValue(kgo.RetryBackoffFn).(func(int) time.Duration)
+	if !ok {
+		t.Fatalf("RetryBackoffFn = %#v", client.OptValue(kgo.RetryBackoffFn))
+	}
+	for attempt, bounds := range [][2]time.Duration{
+		{240 * time.Millisecond, 360 * time.Millisecond},
+		{480 * time.Millisecond, 720 * time.Millisecond},
+		{960 * time.Millisecond, 1440 * time.Millisecond},
+	} {
+		got := backoff(attempt)
+		if got < bounds[0] || got > bounds[1] {
+			t.Fatalf("backoff(%d) = %s, want [%s,%s]", attempt, got, bounds[0], bounds[1])
+		}
+	}
+}
+
+func TestKafkaJSCompatibleStandardCommitCanClearMetadata(t *testing.T) {
+	client := &fakeKafkaJSConsumerClient{}
+	consumer := &kafkaJSCompatibleConsumer{config: ConsumerConfig{GroupID: "group", AutoCommit: false}}
+	record := &kgo.Record{Topic: "topic", Partition: 2, Offset: 17}
+	err := consumer.processRecord(
+		context.Background(),
+		client,
+		record,
+		func(context.Context, MessagePayload) error { return nil },
+		false,
+		ConsumerOptions{NullOffsetCommitMetadata: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, exact := client.snapshot()
+	if want := []int64{18}; !reflect.DeepEqual(exact, want) {
+		t.Fatalf("committed offsets = %v, want %v", exact, want)
+	}
+}
+
 func TestKafkaJSCompatibleConsumerKeepsRebalanceTimeoutIndependentFromMaxPollInterval(t *testing.T) {
 	logger, err := logging.New(logging.Options{Level: "info"})
 	if err != nil {

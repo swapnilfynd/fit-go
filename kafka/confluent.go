@@ -1246,7 +1246,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 						err = fmt.Errorf("kafka/confluent: post-handler commit failed: %w", commitErr)
 					}
 				} else {
-					err = cc.resolveMessageOffset(consumer, message, isAutoCommit, false)
+					err = cc.resolveMessageOffset(consumer, message, isAutoCommit, false, false)
 				}
 				if err != nil {
 					cc.logMessageFailure("kafka/confluent: post-finalizer offset resolution failed", message, err)
@@ -1264,7 +1264,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 			return fmt.Errorf("kafka/confluent: message handler failed: %w", handlerErr)
 		}
 
-		if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, opts.CommitBeforeHandler); err != nil {
+		if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, opts.CommitBeforeHandler, opts.NullOffsetCommitMetadata); err != nil {
 			cc.logMessageFailure("kafka/confluent: post-handler offset resolution failed", message, err)
 			return err
 		}
@@ -1374,7 +1374,7 @@ func (cc *ConfluentConsumer) processBatchGroup(
 		cc.logBatchFailure("kafka/confluent: batch handler error", group.payload, err)
 		return err
 	}
-	if err := cc.resolveMessageOffset(consumer, group.lastMessage, isAutoCommit, opts.CommitBeforeHandler); err != nil {
+	if err := cc.resolveMessageOffset(consumer, group.lastMessage, isAutoCommit, opts.CommitBeforeHandler, opts.NullOffsetCommitMetadata); err != nil {
 		cc.logBatchFailure("kafka/confluent: post-handler batch offset resolution failed", group.payload, err)
 		return err
 	}
@@ -1386,6 +1386,7 @@ func (cc *ConfluentConsumer) resolveMessageOffset(
 	message *ckafka.Message,
 	isAutoCommit bool,
 	committedBeforeHandler bool,
+	nullMetadata bool,
 ) error {
 	if !isAutoCommit && committedBeforeHandler {
 		return nil
@@ -1393,6 +1394,15 @@ func (cc *ConfluentConsumer) resolveMessageOffset(
 	if isAutoCommit && cc.config.AutoCommit {
 		if _, err := consumer.StoreMessage(message); err != nil {
 			return fmt.Errorf("kafka/confluent: post-handler offset store failed: %w", err)
+		}
+		return nil
+	}
+	if nullMetadata {
+		resolved := message.TopicPartition
+		resolved.Offset++
+		resolved.Metadata = nil
+		if _, err := consumer.CommitOffsets([]ckafka.TopicPartition{resolved}); err != nil {
+			return fmt.Errorf("kafka/confluent: post-handler commit failed: %w", err)
 		}
 		return nil
 	}
@@ -2099,6 +2109,14 @@ func validateConfluentConsumerOptions(
 		return false, 0, 0, fmt.Errorf("kafka/confluent: MaxRecords must not be negative")
 	}
 	effectiveAutoCommit := resolveAutoCommit(configAutoCommit, opts.AutoCommit)
+	if opts.NullOffsetCommitMetadata {
+		if effectiveAutoCommit {
+			return false, 0, 0, fmt.Errorf("kafka/confluent: NullOffsetCommitMetadata requires manual commit")
+		}
+		if opts.CommitBeforeHandler {
+			return false, 0, 0, fmt.Errorf("kafka/confluent: NullOffsetCommitMetadata cannot be combined with CommitBeforeHandler")
+		}
+	}
 	if opts.OffsetFinalizer != nil {
 		if effectiveAutoCommit {
 			return false, 0, 0, fmt.Errorf("kafka/confluent: OffsetFinalizer requires manual commit")
@@ -2109,9 +2127,6 @@ func validateConfluentConsumerOptions(
 	} else {
 		if opts.ResolveAfterSuccessfulFinalizer {
 			return false, 0, 0, fmt.Errorf("kafka/confluent: ResolveAfterSuccessfulFinalizer requires OffsetFinalizer")
-		}
-		if opts.NullOffsetCommitMetadata {
-			return false, 0, 0, fmt.Errorf("kafka/confluent: NullOffsetCommitMetadata requires OffsetFinalizer")
 		}
 	}
 

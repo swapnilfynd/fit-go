@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand/v2"
 	"net"
 	"sort"
 	"strings"
@@ -84,6 +86,21 @@ func newKafkaJSCompatibleConsumer(
 	}
 	if !validConsumerShutdownPolicy(config.ShutdownPolicy) {
 		return nil, fmt.Errorf("kafka/kafkajs: unsupported shutdown policy %d", config.ShutdownPolicy)
+	}
+	if config.RetryBackoffMax < 0 {
+		return nil, fmt.Errorf("kafka/kafkajs: RetryBackoffMax must not be negative")
+	}
+	if config.RetryBackoffMultiplier < 0 {
+		return nil, fmt.Errorf("kafka/kafkajs: RetryBackoffMultiplier must not be negative")
+	}
+	if config.RetryBackoffFactor < 0 || config.RetryBackoffFactor >= 1 {
+		return nil, fmt.Errorf("kafka/kafkajs: RetryBackoffFactor must be in [0,1)")
+	}
+	if config.RequestRetries < 0 {
+		return nil, fmt.Errorf("kafka/kafkajs: RequestRetries must not be negative")
+	}
+	if config.DialTimeout < 0 {
+		return nil, fmt.Errorf("kafka/kafkajs: DialTimeout must not be negative")
 	}
 	return &kafkaJSCompatibleConsumer{
 		brokers: append([]string(nil), brokers...),
@@ -180,7 +197,16 @@ func (c *kafkaJSCompatibleConsumer) clientOptions(topics []TopicConfig) ([]kgo.O
 		opts = append(opts, kgo.FetchMaxWait(c.config.MaxWaitTime))
 	}
 	if c.config.RetryBackoff > 0 {
-		opts = append(opts, kgo.RetryBackoffFn(func(int) time.Duration { return c.config.RetryBackoff }))
+		opts = append(opts, kgo.RetryBackoffFn(kafkaJSRetryBackoffFn(c.config)))
+	}
+	if c.config.RequestRetries > 0 {
+		opts = append(opts, kgo.RequestRetries(c.config.RequestRetries))
+	}
+	if c.config.DialTimeout > 0 {
+		opts = append(opts, kgo.DialTimeout(c.config.DialTimeout))
+	}
+	if c.config.ReadCommitted {
+		opts = append(opts, kgo.FetchIsolationLevel(kgo.ReadCommitted()))
 	}
 	if c.config.AutoCommitInterval > 0 {
 		opts = append(opts, kgo.AutoCommitInterval(c.config.AutoCommitInterval))
@@ -219,6 +245,30 @@ func (c *kafkaJSCompatibleConsumer) clientOptions(topics []TopicConfig) ([]kgo.O
 		}),
 	)
 	return opts, nil
+}
+
+func kafkaJSRetryBackoffFn(config ConsumerConfig) func(int) time.Duration {
+	return func(attempt int) time.Duration {
+		// KafkaJS computes and rounds retry delays in integer milliseconds. Keep
+		// that unit here so sub-millisecond Go durations cannot create wire-timing
+		// behavior that the JavaScript client could never produce.
+		delay := float64(config.RetryBackoff) / float64(time.Millisecond)
+		if config.RetryBackoffMultiplier > 1 && attempt > 0 {
+			delay *= math.Pow(config.RetryBackoffMultiplier, float64(attempt))
+		}
+		if config.RetryBackoffFactor > 0 {
+			factor := config.RetryBackoffFactor
+			delay *= (1 - factor) + rand.Float64()*(2*factor)
+			delay = math.Ceil(delay)
+		}
+		if max := float64(config.RetryBackoffMax) / float64(time.Millisecond); max > 0 && delay > max {
+			delay = max
+		}
+		if delay < 0 {
+			return 0
+		}
+		return time.Duration(math.Ceil(delay)) * time.Millisecond
+	}
 }
 
 func topicNames(topics []TopicConfig) []string {
@@ -463,7 +513,7 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		return nil
 	}
-	return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, false)
+	return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, opts.NullOffsetCommitMetadata)
 }
 
 func kafkaJSPayload(record *kgo.Record) MessagePayload {

@@ -1857,8 +1857,18 @@ func TestConfluentConsumerOffsetFinalizerOptionValidation(t *testing.T) {
 	}
 	if _, _, _, err := validateConfluentConsumerOptions(false, ConsumerOptions{
 		NullOffsetCommitMetadata: true,
-	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "requires OffsetFinalizer") {
-		t.Fatalf("null-metadata validation error = %v", err)
+	}, time.Millisecond); err != nil {
+		t.Fatalf("manual null-metadata validation error = %v", err)
+	}
+	if _, _, _, err := validateConfluentConsumerOptions(true, ConsumerOptions{
+		NullOffsetCommitMetadata: true,
+	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "requires manual commit") {
+		t.Fatalf("auto-commit null-metadata validation error = %v", err)
+	}
+	if _, _, _, err := validateConfluentConsumerOptions(false, ConsumerOptions{
+		NullOffsetCommitMetadata: true, CommitBeforeHandler: true,
+	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("commit-before null-metadata validation error = %v", err)
 	}
 }
 

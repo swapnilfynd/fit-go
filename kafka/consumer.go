@@ -195,6 +195,35 @@ type ConsumerConfig struct {
 	// RetryBackoff is the delay before retrying a failed fetch. Default: 100ms.
 	RetryBackoff time.Duration
 
+	// RetryBackoffMax caps an exponential request-retry delay. A zero value keeps
+	// the historical fixed RetryBackoff behavior. KafkaJS-compatible migrations
+	// can pair this with RetryBackoffMultiplier and RetryBackoffFactor to mirror
+	// KafkaJS's randomized exponential retry policy without changing existing
+	// consumers.
+	RetryBackoffMax time.Duration
+
+	// RetryBackoffMultiplier controls exponential request-retry growth. Values
+	// greater than one opt in; the zero value preserves a fixed RetryBackoff.
+	RetryBackoffMultiplier float64
+
+	// RetryBackoffFactor randomizes each exponential delay inside
+	// [delay-factor*delay, delay+factor*delay]. It must be in [0,1). The zero value
+	// disables jitter.
+	RetryBackoffFactor float64
+
+	// RequestRetries sets the Kafka protocol request retry budget. The zero value
+	// keeps the driver default. This is distinct from application-level handler
+	// retries and message redelivery.
+	RequestRetries int
+
+	// DialTimeout bounds one broker connection attempt. The zero value keeps the
+	// driver default.
+	DialTimeout time.Duration
+
+	// ReadCommitted excludes aborted transactional records from fetch results.
+	// The zero value preserves the existing driver default (read uncommitted).
+	ReadCommitted bool
+
 	// AutoCommit controls automatic offset committing. DefaultConsumerConfig sets
 	// this to true; a literal ConsumerConfig{} leaves it false, so callers that build
 	// configs manually should set this explicitly when matching legacy behavior.
@@ -328,12 +357,11 @@ type ConsumerOptions struct {
 	// It is ignored unless OffsetFinalizer is set.
 	ResolveAfterSuccessfulFinalizer bool
 
-	// NullOffsetCommitMetadata clears the Kafka offset-commit metadata on both
-	// commits owned by OffsetFinalizer compatibility mode. KafkaJS commits null
-	// metadata for its explicit current-offset commit and its subsequent resolved
-	// N+1 commit, while franz-go and librdkafka attach the member id by default. This
-	// is deliberately opt-in so existing fit-go consumers keep their driver-native
-	// metadata. It requires OffsetFinalizer.
+	// NullOffsetCommitMetadata clears Kafka offset-commit metadata for manual
+	// synchronous commits. KafkaJS commits null metadata while franz-go and
+	// librdkafka attach member-specific metadata by default. This is deliberately
+	// opt-in so existing fit-go consumers keep their driver-native metadata. It
+	// requires manual commit and cannot be combined with CommitBeforeHandler.
 	NullOffsetCommitMetadata bool
 
 	// RedeliverUnresolvedFinalizer rewinds the KafkaJS-compatible consumer to the
