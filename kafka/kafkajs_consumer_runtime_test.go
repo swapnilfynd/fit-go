@@ -308,6 +308,199 @@ func TestKafkaJSCompatibleNullOffsetCommitMetadataLive(t *testing.T) {
 	}
 }
 
+// TestKafkaJSCompatibleOrdinaryManualCommitNullMetadataLive covers the normal
+// handler-success path used by Mixmaster: auto commit is disabled, no custom
+// finalizer is installed, and ConsumeCtx commits offset+1 after a nil handler
+// result. The coordinator must persist KafkaJS-compatible null metadata.
+func TestKafkaJSCompatibleOrdinaryManualCommitNullMetadataLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	if broker == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-ordinary-null-offset-metadata-" + suffix
+	group := "fit-go-ordinary-null-offset-metadata-group-" + suffix
+	createKafkaJSRuntimeTopic(t, ctx, broker, topic, 1)
+
+	producer, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("ordinary-commit")}).FirstErr(); err != nil {
+		producer.Close()
+		t.Fatalf("produce fixture: %v", err)
+	}
+	producer.Close()
+
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumerConfig := DefaultConsumerConfig(group)
+	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.AutoCommit = false
+	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-ordinary-null-offset-metadata-test"}, consumerConfig, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	manualCommit := false
+	handled := make(chan int64, 1)
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+			if string(payload.Value) != "ordinary-commit" {
+				return fmt.Errorf("unexpected payload %q", payload.Value)
+			}
+			handled <- payload.Offset + 1
+			return nil
+		}, ConsumerOptions{
+			AutoCommit:               &manualCommit,
+			NullOffsetCommitMetadata: true,
+			PollTimeout:              100 * time.Millisecond,
+			MaxRecords:               1,
+		})
+	}()
+
+	var wantOffset int64
+	select {
+	case wantOffset = <-handled:
+	case err := <-consumeDone:
+		t.Fatalf("consumer ended before handling the record: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for ordinary handler")
+	}
+	committed := waitForKafkaJSCommittedTopicPartition(t, ctx, broker, group, topic, wantOffset)
+	if committed.Metadata != nil {
+		t.Fatalf("committed metadata = %q, want nil", *committed.Metadata)
+	}
+
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-consumeDone:
+		if err != nil {
+			t.Fatalf("consumer shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("consumer did not stop")
+	}
+}
+
+// TestKafkaJSCompatibleReadCommittedLive proves that the opt-in fetch isolation
+// hides an aborted transactional record while still delivering the following
+// committed record on the same partition.
+func TestKafkaJSCompatibleReadCommittedLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	if broker == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-read-committed-" + suffix
+	group := "fit-go-read-committed-group-" + suffix
+	createKafkaJSRuntimeTopic(t, ctx, broker, topic, 1)
+
+	transactionalProducer, err := kgo.NewClient(
+		kgo.SeedBrokers(broker),
+		kgo.TransactionalID("fit-go-read-committed-txn-"+suffix),
+		kgo.TransactionTimeout(30*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transactionalProducer.BeginTransaction(); err != nil {
+		transactionalProducer.Close()
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if err := transactionalProducer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("aborted")}).FirstErr(); err != nil {
+		transactionalProducer.Close()
+		t.Fatalf("produce aborted fixture: %v", err)
+	}
+	if err := transactionalProducer.EndTransaction(ctx, kgo.TryAbort); err != nil {
+		transactionalProducer.Close()
+		t.Fatalf("abort transaction: %v", err)
+	}
+	transactionalProducer.Close()
+
+	producer, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("committed")}).FirstErr(); err != nil {
+		producer.Close()
+		t.Fatalf("produce committed fixture: %v", err)
+	}
+	producer.Close()
+
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumerConfig := DefaultConsumerConfig(group)
+	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.AutoCommit = false
+	consumerConfig.ReadCommitted = true
+	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-read-committed-test"}, consumerConfig, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	manualCommit := false
+	received := make(chan string, 4)
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+			received <- string(payload.Value)
+			return nil
+		}, ConsumerOptions{
+			AutoCommit:  &manualCommit,
+			PollTimeout: 100 * time.Millisecond,
+			MaxRecords:  1,
+		})
+	}()
+
+	select {
+	case value := <-received:
+		if value != "committed" {
+			t.Fatalf("first visible record = %q, want committed", value)
+		}
+	case err := <-consumeDone:
+		t.Fatalf("consumer ended before committed record: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for committed record")
+	}
+	select {
+	case value := <-received:
+		t.Fatalf("unexpected additional visible record %q", value)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-consumeDone:
+		if err != nil {
+			t.Fatalf("consumer shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("consumer did not stop")
+	}
+}
+
 // TestKafkaJSCompatibleMixedLegacyGroupLive runs the actual legacy KafkaJS
 // round-robin assigner and the franz-go compatibility backend in one classic
 // consumer group. It proves join, split assignment, rebalance, and leave using
